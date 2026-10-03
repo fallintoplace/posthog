@@ -430,12 +430,14 @@ def _merge(
         contradicted = (set(previous.contradicted_by) if previous else set()) - supports | against
         rule_id = previous.id if previous else uuid.uuid4().hex[:8]
         kept_ids.add(rule_id)
+        # A written rating stays behind the rule once given, so a relabel alone must not write a new version.
+        basis = "written" if previous is not None and previous.basis == "written" else rule.basis
         kept.append(
             LearnedRule(
                 id=rule_id,
                 text=text,
                 kind=rule.kind,
-                basis=rule.basis,
+                basis=basis,
                 evidence=sorted(evidence),
                 contradicted_by=sorted(contradicted),
             )

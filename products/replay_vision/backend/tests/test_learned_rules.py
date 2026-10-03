@@ -82,16 +82,17 @@ class TestMerge:
     def test_evidence_carries_over_and_a_re_rated_observation_moves_sides(self) -> None:
         current = [_stored("a1", "Old wording.", ["obs-1", "obs-2"])]
 
+        relabeled = _rule("New wording.", supported_by=["r3"], contradicted_by=["r2"], rule_id="a1")
         kept = _merge(
             current,
-            [_rule("New wording.", supported_by=["r3"], contradicted_by=["r2"], rule_id="a1")],
+            [relabeled.model_copy(update={"basis": "pattern"})],
             [],
             _RATINGS,
             cap=12,
         )
 
-        assert [(r.id, r.text, r.evidence, r.contradicted_by) for r in kept] == [
-            ("a1", "New wording.", ["obs-1", "obs-3"], ["obs-2"])
+        assert [(r.id, r.text, r.basis, r.evidence, r.contradicted_by) for r in kept] == [
+            ("a1", "New wording.", "written", ["obs-1", "obs-3"], ["obs-2"])
         ]
 
     @parameterized.expand(
