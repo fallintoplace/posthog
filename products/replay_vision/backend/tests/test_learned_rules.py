@@ -4,6 +4,7 @@ from typing import Literal
 from unittest.mock import patch
 
 from django.db.models import F
+from django.test import override_settings
 from django.utils import timezone
 
 from parameterized import parameterized
@@ -192,8 +193,9 @@ class TestLearnedRules(_VisionAPITestCase):
             for row in rows
         ]
 
+    @patch("products.replay_vision.backend.learned_rules.posthoganalytics.capture")
     @patch(_GENERATE_PATH)
-    def test_refresh_writes_new_versions_and_advances_the_watermark(self, mock_generate) -> None:
+    def test_refresh_writes_new_versions_and_advances_the_watermark(self, mock_generate, mock_capture) -> None:
         older = self._rate(self.scanner, is_correct=False, feedback="A declined card is not a bug.")
         newer = self._rate(self.scanner, is_correct=True, age=dt.timedelta(minutes=40))
         mock_generate.return_value = _LlmRules(
@@ -216,11 +218,39 @@ class TestLearnedRules(_VisionAPITestCase):
         assert project.rules[0]["evidence"] == [str(older.observation_id)]
         config = TeamReplayVisionConfig.objects.get(pk=self.team.id)
         assert config.learned_rules_watermark == newer.updated_at
+        # Users never see the rules, so this event is the only trace of what the job wrote.
+        assert sorted(
+            (c.kwargs["properties"]["scope"], c.kwargs["properties"]["rules_added"])
+            for c in mock_capture.call_args_list
+        ) == [("project", 1), ("scanner", 1)]
 
         # Nothing new since the watermark: no model call, no new version.
         mock_generate.reset_mock()
         assert refresh_team_learned_rules(self.team) is False
         mock_generate.assert_not_called()
+
+    @patch(_GENERATE_PATH)
+    def test_repeated_notes_from_one_person_count_once(self, mock_generate) -> None:
+        for _ in range(4):
+            self._rate(self.scanner, is_correct=True, feedback="Routine session, no fault.")
+        self._rate(self.scanner, is_correct=True, feedback="Right, the user never reached checkout.")
+        mock_generate.return_value = _LlmRules(
+            project_rules=[],
+            scanners=[
+                _LlmScannerRules(
+                    scanner="s1",
+                    rules=[_rule("Answer no when checkout never starts.", "encourage", supported_by=["r1", "r2"])],
+                )
+            ],
+        )
+
+        refresh_team_learned_rules(self.team)
+
+        content = mock_generate.call_args.kwargs["user_content"]
+        assert content.count("Team note: Routine session, no fault.") == 1
+        assert "same note on 4 ratings" in content
+        rule = ReplayVisionLearnedRuleset.objects.for_team(self.team.id).get(scanner=self.scanner).rules[0]
+        assert len(rule["evidence"]) == 2
 
     @patch(_GENERATE_PATH)
     def test_unchanged_rules_write_no_new_version(self, mock_generate) -> None:
@@ -299,3 +329,18 @@ class TestLearnedRules(_VisionAPITestCase):
         snapshot = ScannerSnapshot.model_validate({**snapshot_for(self.scanner), "learned_ruleset_ids": ids})
         assert snapshot.learned_ruleset_ids == ids
         assert "learned_ruleset_ids" not in snapshot.model_dump(mode="json")
+
+    def test_staff_can_browse_rulesets_in_admin(self) -> None:
+        ReplayVisionLearnedRuleset.objects.for_team(self.team.id).create(
+            team_id=self.team.id, version=1, rules=[_stored("a1", "A rule.", []).model_dump()]
+        )
+        self.user.is_staff = True
+        self.user.save()
+
+        with override_settings(
+            ADMIN_PORTAL_ENABLED=True,
+            STORAGES={"staticfiles": {"BACKEND": "django.contrib.staticfiles.storage.StaticFilesStorage"}},
+        ):
+            response = self.client.get("/admin/replay_vision/replayvisionlearnedruleset/")
+
+        assert response.status_code == 200

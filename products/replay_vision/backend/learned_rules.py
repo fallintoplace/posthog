@@ -25,9 +25,11 @@ from posthoganalytics.ai.gemini import genai
 from pydantic import BaseModel, Field
 
 from posthog.dataclasses import frozen
+from posthog.event_usage import groups
 from posthog.models.team import Team
 from posthog.models.team.extensions import get_or_create_team_extension
 
+from products.replay_vision.backend.distinct_ids import replay_vision_distinct_id
 from products.replay_vision.backend.models.replay_observation import ObservationStatus, ReplayObservation
 from products.replay_vision.backend.models.replay_observation_label import ReplayObservationLabel
 from products.replay_vision.backend.models.replay_scanner import ReplayScanner, ScannerOrigin
@@ -178,6 +180,25 @@ class _Rating:
     key: str
     label: ReplayObservationLabel
     observation: ReplayObservation
+    # How many ratings this one stands for: one person writing the same note many times counts once.
+    repeats: int = 1
+
+
+def _collapse_repeats(labels: list[ReplayObservationLabel]) -> list[tuple[ReplayObservationLabel, int]]:
+    """Fold ratings where one person gave the same verdict with the same note on the same scanner. Bulk
+    confirmations written by a script would otherwise back a rule with a count no dissent could ever match."""
+    groups: dict[tuple, list[ReplayObservationLabel]] = {}
+    order: list[tuple] = []
+    for label in labels:
+        note = " ".join((label.feedback or "").split()).lower()
+        key: tuple = (
+            (label.created_by_id, label.observation.scanner_id, label.is_correct, note) if note else (label.id,)
+        )
+        if key not in groups:
+            groups[key] = []
+            order.append(key)
+        groups[key].append(label)
+    return [(groups[key][-1], len(groups[key])) for key in order]
 
 
 @frozen
@@ -287,7 +308,8 @@ def refresh_team_learned_rules(team: Team) -> bool:
     watermark = new_labels[-1].updated_at
 
     new_ratings = [
-        _Rating(key=f"r{i + 1}", label=label, observation=label.observation) for i, label in enumerate(new_labels)
+        _Rating(key=f"r{i + 1}", label=label, observation=label.observation, repeats=repeats)
+        for i, (label, repeats) in enumerate(_collapse_repeats(new_labels))
     ]
     scanners: dict[uuid.UUID, ReplayScanner] = {}
     for rating in new_ratings:
@@ -309,20 +331,24 @@ def refresh_team_learned_rules(team: Team) -> bool:
         trace_id=trace_id,
     )
 
-    changed = False
+    updates: list[_ScopeUpdate] = []
     with transaction.atomic():
         project_final = _merge(
             project_current, parsed.project_rules, parsed.project_retired, rating_ids, MAX_PROJECT_RULES
         )
-        changed |= _write_version(team.id, None, project_current, project_final, trace_id)
+        updates.append(_write_version(team.id, None, project_current, project_final, trace_id))
         for entry in parsed.scanners:
             scanner = scanner_keys.get(entry.scanner)
             if scanner is None:
                 continue
             current = scanner_current[scanner.id]
             final = _merge(current, entry.rules, entry.retired, rating_ids, MAX_SCANNER_RULES)
-            changed |= _write_version(team.id, scanner.id, current, final, trace_id)
+            updates.append(_write_version(team.id, scanner.id, current, final, trace_id))
         _stamp(team.id, watermark=watermark)
+    written = [update for update in updates if update.version is not None]
+    changed = bool(written)
+    for update in written:
+        _capture_update(team, update, ratings_read=len(new_labels), trace_id=trace_id)
     logger.info(
         "replay_vision.learned_rules.refreshed",
         team_id=team.id,
@@ -364,9 +390,11 @@ def _context_ratings(
         down = list(base.filter(is_correct=False)[:MAX_CONTEXT_RATINGS_PER_SCANNER])
         take_down = min(len(down), max(half, MAX_CONTEXT_RATINGS_PER_SCANNER - len(up)))
         picked = down[:take_down] + up[: MAX_CONTEXT_RATINGS_PER_SCANNER - take_down]
-        for label in picked:
+        for label, repeats in _collapse_repeats(picked):
             counter += 1
-            out[scanner_id].append(_Rating(key=f"r{counter}", label=label, observation=label.observation))
+            out[scanner_id].append(
+                _Rating(key=f"r{counter}", label=label, observation=label.observation, repeats=repeats)
+            )
     return out
 
 
@@ -461,15 +489,36 @@ def _merge(
     return kept
 
 
+@frozen
+class _ScopeUpdate:
+    scanner_id: uuid.UUID | None
+    # None when nothing changed and no version was written.
+    version: int | None
+    rules: int
+    added: int
+    retired: int
+    contested: int
+
+
 def _write_version(
     team_id: int,
     scanner_id: uuid.UUID | None,
     current: list[LearnedRule],
     final: list[LearnedRule],
     trace_id: str,
-) -> bool:
+) -> _ScopeUpdate:
+    current_ids = {rule.id for rule in current}
+    final_ids = {rule.id for rule in final}
+    update = _ScopeUpdate(
+        scanner_id=scanner_id,
+        version=None,
+        rules=len(final),
+        added=len(final_ids - current_ids),
+        retired=len(current_ids - final_ids),
+        contested=sum(1 for rule in final if rule.contradicted_by),
+    )
     if [rule.model_dump() for rule in final] == [rule.model_dump() for rule in current]:
-        return False
+        return update
     scope = ReplayVisionLearnedRuleset.objects.for_team(team_id, canonical=True).filter(
         Q(scanner__isnull=True) if scanner_id is None else Q(scanner_id=scanner_id)
     )
@@ -482,7 +531,39 @@ def _write_version(
         model=_RULES_MODEL,
         trace_id=trace_id,
     )
-    return True
+    return _ScopeUpdate(
+        scanner_id=scanner_id,
+        version=version,
+        rules=update.rules,
+        added=update.added,
+        retired=update.retired,
+        contested=update.contested,
+    )
+
+
+def _capture_update(team: Team, update: _ScopeUpdate, *, ratings_read: int, trace_id: str) -> None:
+    """Internal telemetry: users never see the rules, so this event is how we follow what the job writes."""
+    try:
+        posthoganalytics.capture(
+            distinct_id=replay_vision_distinct_id(team.id),
+            event="replay_vision_learned_rules_updated",
+            properties={
+                "scope": "scanner" if update.scanner_id else "project",
+                "scanner_id": str(update.scanner_id) if update.scanner_id else None,
+                "version": update.version,
+                "rule_count": update.rules,
+                "rules_added": update.added,
+                "rules_retired": update.retired,
+                "rules_contested": update.contested,
+                "ratings_read": ratings_read,
+                "trace_id": trace_id,
+                "team_id": team.id,
+                "organization_id": str(team.organization_id),
+            },
+            groups=groups(team.organization, team),
+        )
+    except Exception:
+        logger.exception("replay_vision.learned_rules.capture_failed", team_id=team.id)
 
 
 def _describe(rating: _Rating, scanner_version: int) -> str:
@@ -497,7 +578,10 @@ def _describe(rating: _Rating, scanner_version: int) -> str:
     )
     thumb = "thumbs up" if rating.label.is_correct else "thumbs down"
     note = " ".join((rating.label.feedback or "").split())[:_FEEDBACK_CHARS]
-    lines = [f"{rating.key}: {thumb}{stale}", f"  Scanner answered: [{outcome}] {reasoning}"]
+    repeats = (
+        f" (one person left this same note on {rating.repeats} ratings; it counts once)" if rating.repeats > 1 else ""
+    )
+    lines = [f"{rating.key}: {thumb}{stale}{repeats}", f"  Scanner answered: [{outcome}] {reasoning}"]
     details = _output_details(output)
     if details:
         lines.append(f"  Details: {details}")
