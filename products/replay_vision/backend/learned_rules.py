@@ -316,6 +316,15 @@ def refresh_team_learned_rules(team: Team) -> bool:
         stamp_run(team.id)
         return False
     watermark = new_labels[-1].updated_at
+    if len(new_labels) == MAX_NEW_RATINGS_PER_RUN:
+        # The watermark is a strict lower bound, so ratings sharing the last timestamp must all be read now.
+        new_labels += list(
+            _rated_rows()
+            .filter(team_id=team.id, updated_at=watermark)
+            .exclude(id__in=[label.id for label in new_labels])
+            .select_related("observation", "observation__scanner")
+            .order_by("id")
+        )
 
     new_ratings = [
         _Rating(key=f"r{i + 1}", label=label, repeats=repeats)
@@ -349,6 +358,11 @@ def refresh_team_learned_rules(team: Team) -> bool:
         team_id=team.id,
         trace_id=trace_id,
     )
+
+    missing = set(scanner_keys) - {entry.scanner for entry in parsed.scanners}
+    if missing:
+        # Advancing the watermark now would leave those scanners' new ratings unread for good.
+        raise LearnedRulesError(f"response omitted scanners {sorted(missing)}")
 
     updates: list[_ScopeUpdate | None] = []
     with transaction.atomic():

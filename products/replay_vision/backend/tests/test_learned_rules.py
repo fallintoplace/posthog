@@ -282,7 +282,9 @@ class TestLearnedRules(_VisionAPITestCase):
             rules=[_stored("a1", "Keep this rule.", [str(backing.observation_id)]).model_dump()],
         )
         self._rate(self.scanner, is_correct=True)
-        mock_generate.return_value = _LlmRules(project_rules=[_rule("Keep this rule.", rule_id="a1")])
+        mock_generate.return_value = _LlmRules(
+            project_rules=[_rule("Keep this rule.", rule_id="a1")], scanners=[_LlmScannerRules(scanner="s1", rules=[])]
+        )
 
         assert refresh_team_learned_rules(self.team) is False
         assert self._rulesets() == [(None, 1, ["Keep this rule."])]
@@ -291,6 +293,17 @@ class TestLearnedRules(_VisionAPITestCase):
             "id=a1 [avoid] Keep this rule. (backed by 1, contradicted by 0)"
             in (mock_generate.call_args.kwargs["user_content"])
         )
+
+    @patch(_GENERATE_PATH)
+    def test_a_response_missing_a_scanner_keeps_its_ratings_unread(self, mock_generate) -> None:
+        self._rate(self.scanner, is_correct=False, feedback="Declines are normal.")
+        mock_generate.return_value = _LlmRules(project_rules=[_rule("A project rule.")])
+
+        with self.assertRaises(LearnedRulesError):
+            refresh_team_learned_rules(self.team)
+
+        assert self._rulesets() == []
+        assert TeamReplayVisionConfig.objects.get(pk=self.team.id).learned_rules_watermark is None
 
     @patch(_GENERATE_PATH, side_effect=LearnedRulesError("model down"))
     def test_a_failed_run_keeps_the_rules_and_backs_off(self, _mock_generate) -> None:
