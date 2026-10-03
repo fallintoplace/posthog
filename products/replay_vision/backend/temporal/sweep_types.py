@@ -58,11 +58,6 @@ class FindScannerCandidatesOutput(BaseModel, frozen=True):
     keyset_session_id: str = ""
 
 
-class RefreshPromptSuggestionInputs(BaseModel, frozen=True):
-    scanner_id: UUID
-    team_id: int
-
-
 class CheckScannerBudgetInputs(BaseModel, frozen=True):
     scanner_id: UUID
     team_id: int
