@@ -27,7 +27,6 @@ const observation = (overrides: Partial<ReplayObservationApi> = {}): ReplayObser
             provider: 'google',
             emits_signals: true,
             scanner_config: { prompt: PROMPT },
-            verify_positives: 'off',
         },
         scanner_result: {
             model_output: {

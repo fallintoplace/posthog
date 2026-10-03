@@ -400,7 +400,6 @@ const observation = (overrides: Partial<ReplayObservationApi> = {}): ReplayObser
             provider: 'google',
             emits_signals: false,
             scanner_config: { prompt: 'Summarize this session.', length: 'medium' },
-            verify_positives: 'off',
         },
         scanner_result: {
             model_output: {
@@ -574,7 +573,6 @@ const monitorObservationDetail = observation({
             prompt: MONITOR_DETAIL_PROMPT,
             allow_inconclusive: true,
         },
-        verify_positives: 'off',
     },
     scanner_result: {
         model_output: {
@@ -731,7 +729,6 @@ const meta: Meta = {
                                     provider: 'google',
                                     emits_signals: true,
                                     scanner_config: { prompt: 'Did the user hesitate at checkout?' },
-                                    verify_positives: 'off',
                                 },
                                 scanner_result: {
                                     model_output: {
@@ -766,7 +763,6 @@ const meta: Meta = {
                                     provider: 'google',
                                     emits_signals: false,
                                     scanner_config: { prompt: 'Score this session.', scale: { min: 0, max: 10 } },
-                                    verify_positives: 'off',
                                 },
                                 scanner_result: {
                                     model_output: {
