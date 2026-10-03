@@ -116,6 +116,13 @@ class TestMerge:
         if kept:
             assert kept[0].support == support and len(kept[0].contradicted_by) == len(against)
 
+    def test_a_supporter_re_rated_into_a_dissent_does_not_drop_a_well_backed_rule(self) -> None:
+        current = [_stored("a1", "Treat a declined card as normal.", ["obs-1", "obs-2", "obs-3"])]
+
+        kept = _merge(current, [], [_LlmRetired(id="a1", contradicted_by=["r1"])], _RATINGS, cap=12)
+
+        assert [(r.id, r.evidence, r.contradicted_by) for r in kept] == [("a1", ["obs-2", "obs-3"], ["obs-1"])]
+
     def test_flipping_a_well_backed_rule_keeps_the_original(self) -> None:
         current = [_stored("a1", "Avoid flagging declined cards.", ["obs-1", "obs-2", "obs-3"])]
 

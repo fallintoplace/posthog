@@ -525,9 +525,10 @@ def _merge(
 
 
 def _protected(rule: LearnedRule, new_against: set[str]) -> bool:
-    """Whether a rule survives removal: well backed, and still backed by more ratings than go against it."""
+    """Whether a rule survives removal: well backed before this run, and still backed by more ratings than go
+    against it. A supporter re-rated into a dissent counts on both sides, so it cannot alone drop the rule."""
     evidence = set(rule.evidence) - new_against
-    return len(evidence) >= PROTECTED_SUPPORT and len(set(rule.contradicted_by) | new_against) < len(evidence)
+    return len(rule.evidence) >= PROTECTED_SUPPORT and len(set(rule.contradicted_by) | new_against) < len(evidence)
 
 
 def _prune_evidence(team_id: int, rules: list[LearnedRule]) -> list[LearnedRule]:
