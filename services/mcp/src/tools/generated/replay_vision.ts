@@ -971,7 +971,7 @@ const visionScannersCreate = (): ToolBase<
         })
         return withAgentNote(
             await withPostHogUrl(context, result, `/replay-vision/${result.id}`),
-            'A new scanner runs the prompt as written, and the first sweep is where its weaknesses show. Tell the person that rating its results thumbs up or down turns into a config recommendation they can review, and that `_posthogUrl` opens the scanner where they do it. There is nothing to rate yet, so this is a closing sentence for them, not a step for you.\n'
+            'A new scanner runs the prompt as written, and the first sweep is where its weaknesses show. Tell the person that rating its results thumbs up or down, ideally with a short note, teaches the scanner, and that `_posthogUrl` opens the scanner where they do it. There is nothing to rate yet, so this is a closing sentence for them, not a step for you.\n'
         )
     },
 })
