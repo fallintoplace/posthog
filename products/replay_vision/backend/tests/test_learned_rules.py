@@ -147,8 +147,7 @@ class TestLearnedRules(_VisionAPITestCase):
     @patch(_GENERATE_PATH, side_effect=LearnedRulesError("model down"))
     def test_a_failed_run_keeps_the_rules_and_backs_off(self, _mock_generate) -> None:
         self._rate(self.scanner, is_correct=False, feedback="wrong")
-        with patch("products.replay_vision.backend.learned_rules.posthoganalytics.feature_enabled", return_value=True):
-            result = refresh_team_learned_rules_activity(RefreshTeamLearnedRulesInputs(team_id=self.team.id))
+        result = refresh_team_learned_rules_activity(RefreshTeamLearnedRulesInputs(team_id=self.team.id))
 
         assert result is False
         config = TeamReplayVisionConfig.objects.get(pk=self.team.id)

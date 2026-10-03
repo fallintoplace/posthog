@@ -42,8 +42,6 @@ from ee.hogai.utils.untrusted import neutralize_markup
 
 logger = structlog.get_logger(__name__)
 
-LEARNED_RULES_FLAG = "replay-vision-learned-rules"
-
 # Distilling weighs conflicting evidence across scanners, so it gets the reasoning model; it runs rarely.
 _RULES_MODEL = "gemini-3.8-flash"
 _MODEL_CALL_TIMEOUT_MS = 120_000
@@ -220,23 +218,6 @@ def due_teams(limit: int) -> list[int]:
         .order_by("-pending")
     )
     return [row["team_id"] for row in rows[:limit]]
-
-
-def learned_rules_enabled(team: Team) -> bool:
-    """Rollout gate, evaluated per project. Fails closed."""
-    try:
-        return bool(
-            posthoganalytics.feature_enabled(
-                LEARNED_RULES_FLAG,
-                f"team:{team.id}",
-                groups={"organization": str(team.organization_id), "project": str(team.id)},
-                only_evaluate_locally=False,
-                send_feature_flag_events=False,
-            )
-        )
-    except Exception:
-        logger.exception("replay_vision.learned_rules.flag_check_failed", team_id=team.id)
-        return False
 
 
 # ---- distilling ----
