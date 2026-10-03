@@ -470,10 +470,12 @@ def _merge(
     `PROTECTED_SUPPORT` or more ratings behind it is restored when the model drops it on thinner evidence."""
     by_id = {rule.id: rule for rule in current}
     new_against: dict[str, set[str]] = defaultdict(set)
+    # A rule the response also keeps stays its own rule, so a contradictory merge of it is ignored.
+    kept_by_response = {rule.id for rule in proposed if rule.id in by_id and _clean_text(rule.text) is not None}
     merged_into: dict[str, str] = {}
     for entry in retired:
         new_against[entry.id].update(rating_ids[key] for key in entry.contradicted_by if key in rating_ids)
-        if entry.merged_into and entry.merged_into != entry.id:
+        if entry.merged_into and entry.merged_into != entry.id and entry.id not in kept_by_response:
             merged_into[entry.id] = entry.merged_into
 
     kept: list[LearnedRule] = []

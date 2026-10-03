@@ -153,6 +153,25 @@ class TestMerge:
 
         assert [(r.id, r.evidence) for r in kept] == [("keep", ["obs-1", "obs-2", "obs-3", "obs-4"])]
 
+    def test_a_rule_both_kept_and_merged_keeps_its_own_evidence(self) -> None:
+        current = [
+            _stored("keep", "Treat card declines as normal.", ["obs-1"]),
+            _stored("fold", "Do not flag declined payments.", ["obs-2"]),
+        ]
+
+        kept = _merge(
+            current,
+            [
+                _rule("Treat card declines as normal.", rule_id="keep"),
+                _rule("Do not flag declined payments.", rule_id="fold"),
+            ],
+            [_LlmRetired(id="fold", merged_into="keep")],
+            _RATINGS,
+            cap=12,
+        )
+
+        assert [(r.id, r.evidence) for r in kept] == [("keep", ["obs-1"]), ("fold", ["obs-2"])]
+
     def test_over_the_cap_the_thinnest_rules_go(self) -> None:
         current = [_stored("big", "Well backed.", ["obs-1", "obs-2"])]
         proposed = [_rule(f"Rule number {i}.") for i in range(3)] + [_rule("Well backed.", rule_id="big")]
