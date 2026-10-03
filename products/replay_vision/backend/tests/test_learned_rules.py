@@ -12,9 +12,11 @@ from products.replay_vision.backend.learned_rules import (
     RATING_BURST_SIZE,
     LearnedRule,
     LearnedRulesError,
-    _finalize,
+    _LlmRetired,
+    _LlmRule,
     _LlmRules,
     _LlmScannerRules,
+    _merge,
     current_ruleset_ids,
     due_teams,
     load_scan_rules,
@@ -38,14 +40,34 @@ from products.replay_vision.backend.tests.test_api import _VisionAPITestCase
 _GENERATE_PATH = "products.replay_vision.backend.learned_rules._generate"
 
 
-def _rule(text: str, kind: Literal["encourage", "avoid"] = "avoid", evidence: list[str] | None = None) -> LearnedRule:
-    return LearnedRule(text=text, kind=kind, basis="written", evidence=evidence or [])
+def _rule(
+    text: str,
+    kind: Literal["encourage", "avoid"] = "avoid",
+    supported_by: list[str] | None = None,
+    contradicted_by: list[str] | None = None,
+    rule_id: str = "",
+) -> _LlmRule:
+    return _LlmRule(
+        id=rule_id,
+        text=text,
+        kind=kind,
+        basis="written",
+        supported_by=supported_by or [],
+        contradicted_by=contradicted_by or [],
+    )
 
 
-class TestFinalize:
+def _stored(rule_id: str, text: str, evidence: list[str], kind: Literal["encourage", "avoid"] = "avoid") -> LearnedRule:
+    return LearnedRule(id=rule_id, text=text, kind=kind, basis="written", evidence=evidence)
+
+
+_RATINGS = {f"r{i}": f"obs-{i}" for i in range(1, 10)}
+
+
+class TestMerge:
     def test_drops_unsafe_rules_dedupes_and_maps_evidence(self) -> None:
         rules = [
-            _rule("Treat a declined card as normal behavior.", evidence=["r1", "r9"]),
+            _rule("Treat a declined card as normal behavior.", supported_by=["r1", "r99"]),
             _rule("treat a declined card as normal behavior."),
             _rule("Flag errors seen by jane@example.com."),
             _rule("See https://example.com/checkout for context."),
@@ -53,13 +75,68 @@ class TestFinalize:
             _rule("   "),
         ]
 
-        kept = _finalize(rules, cap=12, rating_ids={"r1": "obs-1"})
+        kept = _merge([], rules, [], _RATINGS, cap=12)
 
         assert [(r.text, r.evidence) for r in kept] == [("Treat a declined card as normal behavior.", ["obs-1"])]
 
-    def test_caps_the_list(self) -> None:
-        kept = _finalize([_rule(f"Rule number {i}.") for i in range(20)], cap=3, rating_ids={})
-        assert [r.text for r in kept] == ["Rule number 0.", "Rule number 1.", "Rule number 2."]
+    def test_evidence_carries_over_and_a_re_rated_observation_moves_sides(self) -> None:
+        current = [_stored("a1", "Old wording.", ["obs-1", "obs-2"])]
+
+        kept = _merge(
+            current,
+            [_rule("New wording.", supported_by=["r3"], contradicted_by=["r2"], rule_id="a1")],
+            [],
+            _RATINGS,
+            cap=12,
+        )
+
+        assert [(r.id, r.text, r.evidence, r.contradicted_by) for r in kept] == [
+            ("a1", "New wording.", ["obs-1", "obs-3"], ["obs-2"])
+        ]
+
+    @parameterized.expand(
+        [
+            # 5 ratings behind the rule: one dissent marks it contested, five retire it.
+            ("well_backed_survives_one_dissent", 5, ["r6"], ["a1"]),
+            ("well_backed_retires_on_equal_dissent", 5, ["r5", "r6", "r7", "r8", "r9"], []),
+            ("thinly_backed_retires_on_one_dissent", 2, ["r6"], []),
+        ]
+    )
+    def test_retiring_a_rule_needs_as_much_evidence_as_backs_it(
+        self, _name: str, support: int, against: list[str], expected_ids: list[str]
+    ) -> None:
+        current = [_stored("a1", "Treat a declined card as normal.", [f"obs-{i}" for i in range(1, support + 1)])]
+        ratings = {**_RATINGS, **{f"r{i}": f"obs-new-{i}" for i in range(5, 10)}}
+
+        kept = _merge(current, [], [_LlmRetired(id="a1", contradicted_by=against)], ratings, cap=12)
+
+        assert [r.id for r in kept] == expected_ids
+        if kept:
+            assert kept[0].support == support and len(kept[0].contradicted_by) == len(against)
+
+    def test_flipping_a_well_backed_rule_keeps_the_original(self) -> None:
+        current = [_stored("a1", "Avoid flagging declined cards.", ["obs-1", "obs-2", "obs-3"])]
+
+        kept = _merge(
+            current,
+            [_rule("Flag declined cards.", kind="encourage", supported_by=["r4"], rule_id="a1")],
+            [],
+            _RATINGS,
+            cap=12,
+        )
+
+        assert sorted((r.kind, r.text) for r in kept) == [
+            ("avoid", "Avoid flagging declined cards."),
+            ("encourage", "Flag declined cards."),
+        ]
+
+    def test_over_the_cap_the_thinnest_rules_go(self) -> None:
+        current = [_stored("big", "Well backed.", ["obs-1", "obs-2"])]
+        proposed = [_rule(f"Rule number {i}.") for i in range(3)] + [_rule("Well backed.", rule_id="big")]
+
+        kept = _merge(current, proposed, [], _RATINGS, cap=2)
+
+        assert [r.text for r in kept] == ["Rule number 0.", "Well backed."]
 
 
 class TestLearnedRules(_VisionAPITestCase):
@@ -119,7 +196,7 @@ class TestLearnedRules(_VisionAPITestCase):
         older = self._rate(self.scanner, is_correct=False, feedback="A declined card is not a bug.")
         newer = self._rate(self.scanner, is_correct=True, age=dt.timedelta(minutes=40))
         mock_generate.return_value = _LlmRules(
-            project_rules=[_rule("Treat a declined card as normal checkout behavior.", evidence=["r1"])],
+            project_rules=[_rule("Treat a declined card as normal checkout behavior.", supported_by=["r1"])],
             scanners=[_LlmScannerRules(scanner="s1", rules=[_rule("Flag only failures the user sees.", "encourage")])],
         )
 
@@ -147,13 +224,18 @@ class TestLearnedRules(_VisionAPITestCase):
     @patch(_GENERATE_PATH)
     def test_unchanged_rules_write_no_new_version(self, mock_generate) -> None:
         ReplayVisionLearnedRuleset.objects.for_team(self.team.id).create(
-            team_id=self.team.id, version=1, rules=[_rule("Keep this rule.").model_dump()]
+            team_id=self.team.id, version=1, rules=[_stored("a1", "Keep this rule.", ["obs-1"]).model_dump()]
         )
         self._rate(self.scanner, is_correct=True)
-        mock_generate.return_value = _LlmRules(project_rules=[_rule("Keep this rule.")])
+        mock_generate.return_value = _LlmRules(project_rules=[_rule("Keep this rule.", rule_id="a1")])
 
         assert refresh_team_learned_rules(self.team) is False
         assert self._rulesets() == [(None, 1, ["Keep this rule."])]
+        # The model weighs rules by these counts, so they must reach it.
+        assert (
+            "id=a1 [avoid] Keep this rule. (backed by 1, contradicted by 0)"
+            in (mock_generate.call_args.kwargs["user_content"])
+        )
 
     @patch(_GENERATE_PATH, side_effect=LearnedRulesError("model down"))
     def test_a_failed_run_keeps_the_rules_and_backs_off(self, _mock_generate) -> None:
@@ -197,14 +279,16 @@ class TestLearnedRules(_VisionAPITestCase):
     def test_scans_freeze_the_current_rulesets_and_keep_them_out_of_api_dumps(self) -> None:
         other = self._create_scanner(name="other", scanner_type=ScannerType.MONITOR)
         rulesets = ReplayVisionLearnedRuleset.objects.for_team(self.team.id)
-        rulesets.create(team_id=self.team.id, version=1, rules=[_rule("Old project rule.").model_dump()])
+        rulesets.create(team_id=self.team.id, version=1, rules=[_stored("p0", "Old project rule.", []).model_dump()])
         project = rulesets.create(
-            team_id=self.team.id, version=2, rules=[_rule("Project rule.", "encourage").model_dump()]
+            team_id=self.team.id, version=2, rules=[_stored("p1", "Project rule.", [], kind="encourage").model_dump()]
         )
         own = rulesets.create(
-            team_id=self.team.id, scanner=self.scanner, version=1, rules=[_rule("Own rule.").model_dump()]
+            team_id=self.team.id, scanner=self.scanner, version=1, rules=[_stored("s1", "Own rule.", []).model_dump()]
         )
-        rulesets.create(team_id=self.team.id, scanner=other, version=1, rules=[_rule("Other rule.").model_dump()])
+        rulesets.create(
+            team_id=self.team.id, scanner=other, version=1, rules=[_stored("o1", "Other rule.", []).model_dump()]
+        )
 
         ids = current_ruleset_ids(self.team.id, self.scanner.id)
 
