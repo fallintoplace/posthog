@@ -127,10 +127,24 @@ class TestMerge:
             cap=12,
         )
 
-        assert sorted((r.kind, r.text) for r in kept) == [
-            ("avoid", "Avoid flagging declined cards."),
-            ("encourage", "Flag declined cards."),
+        # The flip cannot clear the guard, so only the original stays, with the dissent recorded.
+        assert [(r.kind, r.text, r.contradicted_by) for r in kept] == [("avoid", "Avoid flagging declined cards.", [])]
+
+    def test_a_merged_rule_hands_its_evidence_to_the_kept_rule(self) -> None:
+        current = [
+            _stored("keep", "Treat card declines as normal.", ["obs-1"]),
+            _stored("fold", "Do not flag declined payments.", ["obs-2", "obs-3", "obs-4"]),
         ]
+
+        kept = _merge(
+            current,
+            [_rule("Treat card declines as normal.", rule_id="keep")],
+            [_LlmRetired(id="fold", merged_into="keep")],
+            _RATINGS,
+            cap=12,
+        )
+
+        assert [(r.id, r.evidence) for r in kept] == [("keep", ["obs-1", "obs-2", "obs-3", "obs-4"])]
 
     def test_over_the_cap_the_thinnest_rules_go(self) -> None:
         current = [_stored("big", "Well backed.", ["obs-1", "obs-2"])]
@@ -254,8 +268,11 @@ class TestLearnedRules(_VisionAPITestCase):
 
     @patch(_GENERATE_PATH)
     def test_unchanged_rules_write_no_new_version(self, mock_generate) -> None:
+        backing = self._rate(self.scanner, is_correct=True, age=dt.timedelta(days=200))
         ReplayVisionLearnedRuleset.objects.for_team(self.team.id).create(
-            team_id=self.team.id, version=1, rules=[_stored("a1", "Keep this rule.", ["obs-1"]).model_dump()]
+            team_id=self.team.id,
+            version=1,
+            rules=[_stored("a1", "Keep this rule.", [str(backing.observation_id)]).model_dump()],
         )
         self._rate(self.scanner, is_correct=True)
         mock_generate.return_value = _LlmRules(project_rules=[_rule("Keep this rule.", rule_id="a1")])
@@ -329,6 +346,26 @@ class TestLearnedRules(_VisionAPITestCase):
         snapshot = ScannerSnapshot.model_validate({**snapshot_for(self.scanner), "learned_ruleset_ids": ids})
         assert snapshot.learned_ruleset_ids == ids
         assert "learned_ruleset_ids" not in snapshot.model_dump(mode="json")
+
+    @patch(_GENERATE_PATH)
+    def test_removed_ratings_stop_protecting_a_rule(self, mock_generate) -> None:
+        backing = [self._rate(self.scanner, is_correct=False, feedback="Declines are normal.") for _ in range(3)]
+        ReplayVisionLearnedRuleset.objects.for_team(self.team.id).create(
+            team_id=self.team.id,
+            scanner=self.scanner,
+            version=1,
+            rules=[_stored("a1", "Treat declines as normal.", [str(b.observation_id) for b in backing]).model_dump()],
+        )
+        for label in backing[:2]:
+            label.delete()
+        self._rate(self.scanner, is_correct=True, feedback="Declines matter here.")
+        mock_generate.return_value = _LlmRules(
+            project_rules=[], scanners=[_LlmScannerRules(scanner="s1", rules=[], retired=[_LlmRetired(id="a1")])]
+        )
+
+        refresh_team_learned_rules(self.team)
+
+        assert self._rulesets()[-1] == (str(self.scanner.id), 2, [])
 
     def test_staff_can_browse_rulesets_in_admin(self) -> None:
         ReplayVisionLearnedRuleset.objects.for_team(self.team.id).create(

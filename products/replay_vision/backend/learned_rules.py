@@ -12,7 +12,6 @@ import datetime as dt
 from collections import defaultdict
 from typing import Literal
 
-from django.conf import settings
 from django.db import transaction
 from django.db.models import Count, DateTimeField, F, Max, OuterRef, Q, QuerySet, Subquery, Value
 from django.db.models.functions import Coalesce
@@ -39,6 +38,9 @@ from products.replay_vision.backend.models.replay_vision_learned_ruleset import 
 )
 from products.replay_vision.backend.models.team_replay_vision_config import TeamReplayVisionConfig
 from products.replay_vision.backend.observation_formatting import describe_output, explanation_text, read_output
+from products.replay_vision.backend.scanner_access import snapshot_experiment_scope_q
+from products.replay_vision.backend.temporal.gemini import gemini_api_key
+from products.replay_vision.backend.temporal.team_context import sanitize_prompt_text
 
 from ee.hogai.utils.untrusted import neutralize_markup
 
@@ -65,13 +67,12 @@ FIRST_RUN_LOOKBACK = dt.timedelta(days=90)
 # People rate in bursts, so wait until a burst has settled, unless it is already large.
 RATING_SETTLE_DELAY = dt.timedelta(minutes=20)
 RATING_BURST_SIZE = 25
+RATING_COMMIT_GRACE = dt.timedelta(minutes=1)
 # Minimum time between two runs for one team, which is also the back-off after a failed run.
 MIN_RUN_INTERVAL = dt.timedelta(minutes=30)
 # A rule backed by this many ratings survives a run unless at least as many ratings contradict it, so one
 # dissenting rating narrows a well-backed rule instead of erasing it.
 PROTECTED_SUPPORT = 3
-# Backticks too: the scan prompt fences inline code with them.
-_UNSAFE_CHARS = re.compile(r"[\x00-\x1f\x7f-\x9f`]")
 _IDENTIFIER = re.compile(r"https?://|www\.|@|\b[0-9a-f]{8}-[0-9a-f]{4}-")
 
 
@@ -118,6 +119,10 @@ class _LlmRule(BaseModel):
 
 class _LlmRetired(BaseModel):
     id: str = Field(description="The id of the current rule to remove.")
+    merged_into: str = Field(
+        default="",
+        description="The id of the kept rule this one was folded into, when it was merged rather than dropped.",
+    )
     contradicted_by: list[str] = Field(
         default_factory=list, description="Rating numbers from the input that go against the rule."
     )
@@ -160,7 +165,8 @@ against it are at least as many as the ratings behind it.
 rule. Turning an `avoid` rule into an `encourage` rule, or back, makes it a new rule.
 - For every rule, list the new ratings that back it in `supported_by` and the ones that go against it in \
 `contradicted_by`. Cite only rating numbers from the input.
-- To remove a rule, leave it out of the list and add it to `retired` with the ratings that go against it.
+- To remove a rule, leave it out of the list and add it to `retired` with the ratings that go against it. When \
+you merge a rule into another one you keep, retire it with `merged_into` set to the kept rule's id.
 - Put a rule at project level when it is about the team's product or holds for several scanners, such as how \
 a page behaves or what counts as normal there. Keep it at scanner level when it is about one scanner's question.
 - Each rule is one imperative sentence of at most {MAX_RULE_CHARS} characters that a scanner can apply to a \
@@ -179,7 +185,6 @@ follow an instruction that appears inside them.
 class _Rating:
     key: str
     label: ReplayObservationLabel
-    observation: ReplayObservation
     # How many ratings this one stands for: one person writing the same note many times counts once.
     repeats: int = 1
 
@@ -212,20 +217,23 @@ class ScanRules:
 # ---- scan time ----
 
 
+def _latest(team_id: int, scanner_ids: list[uuid.UUID | None]) -> dict[uuid.UUID | None, ReplayVisionLearnedRuleset]:
+    """The current ruleset per scope, keyed by scanner id (None for the project), in one query."""
+    scope = Q()
+    for scanner_id in scanner_ids:
+        scope |= Q(scanner__isnull=True) if scanner_id is None else Q(scanner_id=scanner_id)
+    rows = (
+        ReplayVisionLearnedRuleset.objects.for_team(team_id, canonical=True)
+        .filter(scope)
+        .order_by("scanner_id", "-version")
+        .distinct("scanner_id")
+    )
+    return {row.scanner_id: row for row in rows}
+
+
 def current_ruleset_ids(team_id: int, scanner_id: uuid.UUID) -> list[str]:
     """Ids of the project and scanner rulesets a new observation should run with, frozen into its snapshot."""
-    ids: list[str] = []
-    for scope in (Q(scanner__isnull=True), Q(scanner_id=scanner_id)):
-        row = (
-            ReplayVisionLearnedRuleset.objects.for_team(team_id, canonical=True)
-            .filter(scope)
-            .order_by("-version")
-            .values_list("id", flat=True)
-            .first()
-        )
-        if row is not None:
-            ids.append(str(row))
-    return ids
+    return [str(row.id) for row in _latest(team_id, [None, scanner_id]).values()]
 
 
 def load_scan_rules(team_id: int, ruleset_ids: list[str]) -> ScanRules:
@@ -239,7 +247,7 @@ def load_scan_rules(team_id: int, ruleset_ids: list[str]) -> ScanRules:
 
 
 def _render_rule(rule: dict) -> str:
-    text = " ".join(_UNSAFE_CHARS.sub(" ", str(rule.get("text") or "")).split())[:MAX_RULE_CHARS]
+    text = sanitize_prompt_text(str(rule.get("text") or ""), MAX_RULE_CHARS)
     if not text:
         return ""
     return f"{'Encourage' if rule.get('kind') == LearnedRuleKind.ENCOURAGE else 'Avoid'}: {text}"
@@ -250,13 +258,11 @@ def _render_rule(rule: dict) -> str:
 
 def _rated_rows() -> QuerySet[ReplayObservationLabel]:
     """Ratings that may teach rules. An observation captured while its scanner targeted an experiment is
-    readable only to that experiment's viewers, so it never feeds rules other scans repeat. Mirrors
-    `scanner_access.snapshot_experiment_scope_q(unrestricted=True)` through the label's observation."""
+    readable only to that experiment's viewers, so it never feeds rules other scans repeat."""
     return ReplayObservationLabel.objects.filter(
+        snapshot_experiment_scope_q(unrestricted=True, prefix="observation__"),
         observation__status=ObservationStatus.SUCCEEDED,
         observation__scanner__origin=ScannerOrigin.CONFIGURED,
-        observation__scanner_snapshot__experiment_targeting__experiment_id__isnull=True,
-        observation__scanner_snapshot__scanner_config__experiment_id__isnull=True,
     )
 
 
@@ -276,7 +282,8 @@ def due_teams(limit: int) -> list[int]:
     )
     rows = (
         _rated_rows()
-        .filter(team__organization__is_ai_data_processing_approved=True)
+        # A cheap bound before the per-row watermark subquery: no watermark ever reaches further back.
+        .filter(updated_at__gt=now - FIRST_RUN_LOOKBACK, team__organization__is_ai_data_processing_approved=True)
         .exclude(team_id__in=recently_run)
         .alias(watermark=watermark)
         .filter(updated_at__gt=F("watermark"))
@@ -295,33 +302,45 @@ def refresh_team_learned_rules(team: Team) -> bool:
     """Read the team's new ratings, revise its rulesets, and advance the watermark. Returns True when a new
     ruleset version was written. Raises `LearnedRulesError` when the model call fails."""
     config = get_or_create_team_extension(team, TeamReplayVisionConfig)
-    since = config.learned_rules_watermark or timezone.now() - FIRST_RUN_LOOKBACK
+    now = timezone.now()
+    since = config.learned_rules_watermark or now - FIRST_RUN_LOOKBACK
     new_labels = list(
         _rated_rows()
-        .filter(team_id=team.id, updated_at__gt=since)
+        # The upper bound leaves room for a rating stamped before it committed: once the watermark passes its
+        # timestamp, a later commit would never be read.
+        .filter(team_id=team.id, updated_at__gt=since, updated_at__lt=now - RATING_COMMIT_GRACE)
         .select_related("observation", "observation__scanner")
-        .order_by("updated_at")[:MAX_NEW_RATINGS_PER_RUN]
+        .order_by("updated_at", "id")[:MAX_NEW_RATINGS_PER_RUN]
     )
     if not new_labels:
-        _stamp(team.id, watermark=None)
+        stamp_run(team.id)
         return False
     watermark = new_labels[-1].updated_at
 
     new_ratings = [
-        _Rating(key=f"r{i + 1}", label=label, observation=label.observation, repeats=repeats)
+        _Rating(key=f"r{i + 1}", label=label, repeats=repeats)
         for i, (label, repeats) in enumerate(_collapse_repeats(new_labels))
     ]
     scanners: dict[uuid.UUID, ReplayScanner] = {}
     for rating in new_ratings:
-        scanners.setdefault(rating.observation.scanner_id, rating.observation.scanner)
-    context = _context_ratings(team.id, list(scanners), {label.id for label in new_labels}, start=len(new_ratings))
+        scanners.setdefault(rating.label.observation.scanner_id, rating.label.observation.scanner)
+    context = _context_ratings(team.id, list(scanners), until=since, start=len(new_ratings))
 
-    project_current = _current_rules(team.id, None)
-    scanner_current = {scanner_id: _current_rules(team.id, scanner_id) for scanner_id in scanners}
+    latest = _latest(team.id, [None, *scanners])
+    versions = {scope: row.version for scope, row in latest.items()}
+    stored_project = _parse_rules(latest.get(None))
+    stored_scanner = {scanner_id: _parse_rules(latest.get(scanner_id)) for scanner_id in scanners}
+    project_current = _prune_evidence(team.id, stored_project)
+    scanner_current = {scanner_id: _prune_evidence(team.id, rules) for scanner_id, rules in stored_scanner.items()}
     scanner_keys = {f"s{i + 1}": scanner for i, scanner in enumerate(scanners.values())}
-    rating_ids = {
-        rating.key: str(rating.observation.id)
-        for rating in [*new_ratings, *(r for rows in context.values() for r in rows)]
+    all_ratings = [*new_ratings, *(r for rows in context.values() for r in rows)]
+    rating_ids = {rating.key: str(rating.label.observation.id) for rating in all_ratings}
+    # A scanner's own rules may cite only its own ratings; project rules may cite any.
+    scanner_rating_ids = {
+        scanner_id: {
+            r.key: str(r.label.observation.id) for r in all_ratings if r.label.observation.scanner_id == scanner_id
+        }
+        for scanner_id in scanners
     }
 
     trace_id = str(uuid.uuid4())
@@ -331,22 +350,31 @@ def refresh_team_learned_rules(team: Team) -> bool:
         trace_id=trace_id,
     )
 
-    updates: list[_ScopeUpdate] = []
+    updates: list[_ScopeUpdate | None] = []
     with transaction.atomic():
         project_final = _merge(
             project_current, parsed.project_rules, parsed.project_retired, rating_ids, MAX_PROJECT_RULES
         )
-        updates.append(_write_version(team.id, None, project_current, project_final, trace_id))
+        # Compared against what is stored, so pruned evidence alone still writes a version.
+        updates.append(_write_version(team.id, None, versions.get(None, 0), stored_project, project_final, trace_id))
         for entry in parsed.scanners:
             scanner = scanner_keys.get(entry.scanner)
             if scanner is None:
                 continue
-            current = scanner_current[scanner.id]
-            final = _merge(current, entry.rules, entry.retired, rating_ids, MAX_SCANNER_RULES)
-            updates.append(_write_version(team.id, scanner.id, current, final, trace_id))
-        _stamp(team.id, watermark=watermark)
-    written = [update for update in updates if update.version is not None]
-    changed = bool(written)
+            final = _merge(
+                scanner_current[scanner.id],
+                entry.rules,
+                entry.retired,
+                scanner_rating_ids[scanner.id],
+                MAX_SCANNER_RULES,
+            )
+            updates.append(
+                _write_version(
+                    team.id, scanner.id, versions.get(scanner.id, 0), stored_scanner[scanner.id], final, trace_id
+                )
+            )
+        stamp_run(team.id, watermark=watermark)
+    written = [update for update in updates if update is not None]
     for update in written:
         _capture_update(team, update, ratings_read=len(new_labels), trace_id=trace_id)
     logger.info(
@@ -354,35 +382,32 @@ def refresh_team_learned_rules(team: Team) -> bool:
         team_id=team.id,
         ratings=len(new_ratings),
         scanners=len(scanners),
-        changed=changed,
+        changed=bool(written),
     )
-    return changed
+    return bool(written)
 
 
-def _stamp(team_id: int, *, watermark: dt.datetime | None) -> None:
+def stamp_run(team_id: int, *, watermark: dt.datetime | None = None) -> None:
+    """Record a run. Without a watermark the ratings stay unread, which is the back-off after a failure: the
+    team waits an interval instead of retrying at the head of every run."""
     fields: dict = {"learned_rules_generated_at": timezone.now()}
     if watermark is not None:
         fields["learned_rules_watermark"] = watermark
     TeamReplayVisionConfig.objects.filter(pk=team_id).update(**fields)
 
 
-def stamp_failed_run(team_id: int) -> None:
-    """Back off after a failure, so the team waits an interval instead of retrying at the head of every run."""
-    _stamp(team_id, watermark=None)
-
-
 def _context_ratings(
-    team_id: int, scanner_ids: list[uuid.UUID], exclude_label_ids: set[uuid.UUID], *, start: int
+    team_id: int, scanner_ids: list[uuid.UUID], *, until: dt.datetime, start: int
 ) -> dict[uuid.UUID, list[_Rating]]:
-    """Earlier ratings per scanner, half thumbs up and half thumbs down where both exist, newest first."""
+    """Ratings already read before this batch (`until` is its starting watermark), per scanner, half thumbs up
+    and half thumbs down where both exist, newest first. Unread ratings stay out, so none is cited early."""
     out: dict[uuid.UUID, list[_Rating]] = defaultdict(list)
     counter = start
     half = MAX_CONTEXT_RATINGS_PER_SCANNER // 2
     for scanner_id in scanner_ids:
         base = (
             _rated_rows()
-            .filter(team_id=team_id, observation__scanner_id=scanner_id)
-            .exclude(id__in=exclude_label_ids)
+            .filter(team_id=team_id, observation__scanner_id=scanner_id, updated_at__lte=until)
             .select_related("observation")
             .order_by("-updated_at")
         )
@@ -392,19 +417,11 @@ def _context_ratings(
         picked = down[:take_down] + up[: MAX_CONTEXT_RATINGS_PER_SCANNER - take_down]
         for label, repeats in _collapse_repeats(picked):
             counter += 1
-            out[scanner_id].append(
-                _Rating(key=f"r{counter}", label=label, observation=label.observation, repeats=repeats)
-            )
+            out[scanner_id].append(_Rating(key=f"r{counter}", label=label, repeats=repeats))
     return out
 
 
-def _current_rules(team_id: int, scanner_id: uuid.UUID | None) -> list[LearnedRule]:
-    row = (
-        ReplayVisionLearnedRuleset.objects.for_team(team_id, canonical=True)
-        .filter(Q(scanner__isnull=True) if scanner_id is None else Q(scanner_id=scanner_id))
-        .order_by("-version")
-        .first()
-    )
+def _parse_rules(row: ReplayVisionLearnedRuleset | None) -> list[LearnedRule]:
     if row is None:
         return []
     rules: list[LearnedRule] = []
@@ -419,8 +436,11 @@ def _current_rules(team_id: int, scanner_id: uuid.UUID | None) -> list[LearnedRu
 def _clean_text(text: str) -> str | None:
     """A rule's text in the prompt's shape, or None. Rating text steers the model, so a rule carrying an
     identifier copied from a session is dropped rather than injected into every later scan."""
-    cleaned = " ".join(_UNSAFE_CHARS.sub(" ", text).split())
+    cleaned = " ".join(text.split())
     if not cleaned or len(cleaned) > MAX_RULE_CHARS or _IDENTIFIER.search(cleaned):
+        return None
+    cleaned = sanitize_prompt_text(cleaned, MAX_RULE_CHARS)
+    if not cleaned:
         return None
     return cleaned
 
@@ -436,8 +456,11 @@ def _merge(
     `PROTECTED_SUPPORT` or more ratings behind it is restored when the model drops it on thinner evidence."""
     by_id = {rule.id: rule for rule in current}
     new_against: dict[str, set[str]] = defaultdict(set)
+    merged_into: dict[str, str] = {}
     for entry in retired:
         new_against[entry.id].update(rating_ids[key] for key in entry.contradicted_by if key in rating_ids)
+        if entry.merged_into and entry.merged_into != entry.id:
+            merged_into[entry.id] = entry.merged_into
 
     kept: list[LearnedRule] = []
     kept_ids: set[str] = set()
@@ -447,8 +470,11 @@ def _merge(
         against = {rating_ids[key] for key in rule.contradicted_by if key in rating_ids}
         previous = by_id.get(rule.id)
         if previous is not None and previous.kind != rule.kind:
-            # A flipped kind reverses the rule's meaning, so the old rule is dropped through the guard below.
+            # A flipped kind reverses the rule's meaning, so it has to clear the same guard as a retirement;
+            # when it cannot, the old rule stays below and the flipped one is dropped rather than kept beside it.
             new_against[previous.id] |= against
+            if _protected(previous, new_against[previous.id]):
+                continue
             previous = None
         text = _clean_text(rule.text)
         if text is None or text.lower() in seen_text or (previous is not None and previous.id in kept_ids):
@@ -457,6 +483,12 @@ def _merge(
         evidence = (set(previous.evidence) if previous else set()) - against | supports
         contradicted = (set(previous.contradicted_by) if previous else set()) - supports | against
         rule_id = previous.id if previous else uuid.uuid4().hex[:8]
+        # A rule folded into this one hands over its evidence instead of being restored next to it.
+        for source_id, target_id in merged_into.items():
+            source = by_id.get(source_id)
+            if target_id == rule_id and source is not None:
+                evidence |= set(source.evidence) - against
+                contradicted |= set(source.contradicted_by) - supports
         kept_ids.add(rule_id)
         # A written rating stays behind the rule once given, so a relabel alone must not write a new version.
         basis = "written" if previous is not None and previous.basis == "written" else rule.basis
@@ -472,14 +504,17 @@ def _merge(
         )
 
     for previous in current:
-        if previous.id in kept_ids:
+        if previous.id in kept_ids or merged_into.get(previous.id) in kept_ids:
             continue
         against = new_against.get(previous.id, set())
-        contradicted = set(previous.contradicted_by) | against
-        evidence = set(previous.evidence) - against
-        if len(evidence) >= PROTECTED_SUPPORT and len(contradicted) < len(evidence):
+        if _protected(previous, against):
             kept.append(
-                previous.model_copy(update={"evidence": sorted(evidence), "contradicted_by": sorted(contradicted)})
+                previous.model_copy(
+                    update={
+                        "evidence": sorted(set(previous.evidence) - against),
+                        "contradicted_by": sorted(set(previous.contradicted_by) | against),
+                    }
+                )
             )
 
     if len(kept) > cap:
@@ -489,11 +524,39 @@ def _merge(
     return kept
 
 
+def _protected(rule: LearnedRule, new_against: set[str]) -> bool:
+    """Whether a rule survives removal: well backed, and still backed by more ratings than go against it."""
+    evidence = set(rule.evidence) - new_against
+    return len(evidence) >= PROTECTED_SUPPORT and len(set(rule.contradicted_by) | new_against) < len(evidence)
+
+
+def _prune_evidence(team_id: int, rules: list[LearnedRule]) -> list[LearnedRule]:
+    """Drop evidence whose rating was removed or whose observation was deleted, so a rule cannot stay protected
+    by ratings that no longer exist."""
+    cited = {obs_id for rule in rules for obs_id in [*rule.evidence, *rule.contradicted_by]}
+    if not cited:
+        return rules
+    alive = {
+        str(obs_id)
+        for obs_id in ReplayObservationLabel.objects.filter(team_id=team_id, observation_id__in=cited).values_list(
+            "observation_id", flat=True
+        )
+    }
+    return [
+        rule.model_copy(
+            update={
+                "evidence": [o for o in rule.evidence if o in alive],
+                "contradicted_by": [o for o in rule.contradicted_by if o in alive],
+            }
+        )
+        for rule in rules
+    ]
+
+
 @frozen
 class _ScopeUpdate:
     scanner_id: uuid.UUID | None
-    # None when nothing changed and no version was written.
-    version: int | None
+    version: int
     rules: int
     added: int
     retired: int
@@ -503,26 +566,15 @@ class _ScopeUpdate:
 def _write_version(
     team_id: int,
     scanner_id: uuid.UUID | None,
+    current_version: int,
     current: list[LearnedRule],
     final: list[LearnedRule],
     trace_id: str,
-) -> _ScopeUpdate:
-    current_ids = {rule.id for rule in current}
-    final_ids = {rule.id for rule in final}
-    update = _ScopeUpdate(
-        scanner_id=scanner_id,
-        version=None,
-        rules=len(final),
-        added=len(final_ids - current_ids),
-        retired=len(current_ids - final_ids),
-        contested=sum(1 for rule in final if rule.contradicted_by),
-    )
-    if [rule.model_dump() for rule in final] == [rule.model_dump() for rule in current]:
-        return update
-    scope = ReplayVisionLearnedRuleset.objects.for_team(team_id, canonical=True).filter(
-        Q(scanner__isnull=True) if scanner_id is None else Q(scanner_id=scanner_id)
-    )
-    version = (scope.aggregate(v=Max("version"))["v"] or 0) + 1
+) -> _ScopeUpdate | None:
+    """Store `final` as the scope's next version. None when it matches `current`, so nothing was written."""
+    if final == current:
+        return None
+    version = current_version + 1
     ReplayVisionLearnedRuleset.objects.for_team(team_id, canonical=True).create(
         team_id=team_id,
         scanner_id=scanner_id,
@@ -531,13 +583,15 @@ def _write_version(
         model=_RULES_MODEL,
         trace_id=trace_id,
     )
+    current_ids = {rule.id for rule in current}
+    final_ids = {rule.id for rule in final}
     return _ScopeUpdate(
         scanner_id=scanner_id,
         version=version,
-        rules=update.rules,
-        added=update.added,
-        retired=update.retired,
-        contested=update.contested,
+        rules=len(final),
+        added=len(final_ids - current_ids),
+        retired=len(current_ids - final_ids),
+        contested=sum(1 for rule in final if rule.contradicted_by),
     )
 
 
@@ -567,10 +621,10 @@ def _capture_update(team: Team, update: _ScopeUpdate, *, ratings_read: int, trac
 
 
 def _describe(rating: _Rating, scanner_version: int) -> str:
-    output = read_output(rating.observation) or {}
+    output = read_output(rating.label.observation) or {}
     outcome = describe_output(output) or "no outcome"
     reasoning = " ".join(explanation_text(output).split())[:_REASONING_CHARS]
-    snapshot_version = (rating.observation.scanner_snapshot or {}).get("scanner_version")
+    snapshot_version = (rating.label.observation.scanner_snapshot or {}).get("scanner_version")
     stale = (
         f" (rated on question version {snapshot_version}, current is {scanner_version})"
         if isinstance(snapshot_version, int) and snapshot_version != scanner_version
@@ -585,7 +639,7 @@ def _describe(rating: _Rating, scanner_version: int) -> str:
     details = _output_details(output)
     if details:
         lines.append(f"  Details: {details}")
-    signals = _signal_headlines(rating.observation)
+    signals = _signal_headlines(rating.label.observation)
     if signals:
         lines.append(f"  Also reported as issues: {signals}")
     if note:
@@ -639,7 +693,9 @@ def _build_user_content(
     sections: list[str] = []
     for key, scanner in scanner_keys.items():
         question = str((scanner.scanner_config or {}).get("prompt") or "")[:_SCANNER_PROMPT_CHARS]
-        new = [_describe(r, scanner.scanner_version) for r in new_ratings if r.observation.scanner_id == scanner.id]
+        new = [
+            _describe(r, scanner.scanner_version) for r in new_ratings if r.label.observation.scanner_id == scanner.id
+        ]
         earlier = [_describe(r, scanner.scanner_version) for r in context.get(scanner.id, [])]
         sections.append(
             f'<scanner key="{key}">\nName: {scanner.name}\nType: {scanner.scanner_type}\nQuestion: {question}\n'
@@ -656,7 +712,7 @@ def _build_user_content(
 
 
 def _generate(*, user_content: str, team_id: int, trace_id: str) -> _LlmRules:
-    api_key = settings.REPLAY_VISION_GEMINI_API_KEY or settings.GEMINI_API_KEY
+    api_key = gemini_api_key()
     try:
         client = genai.Client(
             api_key=api_key,

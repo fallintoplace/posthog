@@ -271,8 +271,6 @@ def _create_observation(inputs: CreateObservationInputs) -> CreateObservationOut
     else:
         snapshot_dict = _build_scanner_snapshot(scanner)
         priced_model = scanner.model
-    # Learned rules are not scanner config, so a backfill runs with the current ones rather than frozen ones.
-    snapshot_dict["learned_ruleset_ids"] = current_ruleset_ids(scanner.team_id, scanner.id)
 
     # Deliberately check-then-act: the snapshot doesn't count enqueue claims, so a concurrent burst can
     # overshoot by at most the in-flight caps allow, which is accepted.
@@ -289,6 +287,8 @@ def _create_observation(inputs: CreateObservationInputs) -> CreateObservationOut
             was_created=False,
             scanner_type=scanner.scanner_type,
         )
+    # Learned rules are not scanner config, so a backfill runs with the current ones rather than frozen ones.
+    snapshot_dict["learned_ruleset_ids"] = current_ruleset_ids(scanner.team_id, scanner.id)
 
     # Shared by the insert and the retake below, so a column added here can't be set on one path only.
     row_fields: dict[str, Any] = {

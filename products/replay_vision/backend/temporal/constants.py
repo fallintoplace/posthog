@@ -270,8 +270,9 @@ LEARNED_RULES_WORKFLOW_ID = "replay-vision-learned-rules-refresher"
 LEARNED_RULES_SCHEDULE_ID = "replay-vision-learned-rules-refresher-schedule"
 LEARNED_RULES_REFRESH_INTERVAL = dt.timedelta(minutes=10)
 LEARNED_RULES_EXECUTION_TIMEOUT = dt.timedelta(minutes=9)
-LEARNED_RULES_MAX_TEAMS_PER_RUN = 40
-LEARNED_RULES_CONCURRENCY = 8
+# Two waves of the 4-minute activity timeout fit inside the 9-minute execution timeout.
+LEARNED_RULES_MAX_TEAMS_PER_RUN = 32
+LEARNED_RULES_CONCURRENCY = 16
 LIST_DUE_LEARNED_RULES_TIMEOUT = dt.timedelta(seconds=60)
 # Covers the model call's own 120s timeout plus the database reads around it.
 REFRESH_TEAM_LEARNED_RULES_TIMEOUT = dt.timedelta(minutes=4)

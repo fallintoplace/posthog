@@ -90,19 +90,19 @@ def scanner_experiment_scope_q(*, unrestricted: bool = False, experiment_ids: It
     return q
 
 
-def snapshot_experiment_scope_q(*, unrestricted: bool = False, experiment_ids: Iterable[int] = ()) -> Q:
-    """`scanner_experiment_scope_q` for observation rows, over the frozen `scanner_snapshot`."""
+def snapshot_experiment_scope_q(
+    *, unrestricted: bool = False, experiment_ids: Iterable[int] = (), prefix: str = ""
+) -> Q:
+    """`scanner_experiment_scope_q` for observation rows, over the frozen `scanner_snapshot`. `prefix` reaches the
+    observation through a relation, such as `observation__` from a label."""
+    targeting = f"{prefix}scanner_snapshot__experiment_targeting__experiment_id"
+    config = f"{prefix}scanner_snapshot__scanner_config__experiment_id"
     q = Q()
     if unrestricted:
-        q |= Q(
-            scanner_snapshot__experiment_targeting__experiment_id__isnull=True,
-            scanner_snapshot__scanner_config__experiment_id__isnull=True,
-        )
+        q |= Q(**{f"{targeting}__isnull": True, f"{config}__isnull": True})
     ids = list(experiment_ids)
     if ids:
-        q |= Q(scanner_snapshot__experiment_targeting__experiment_id__in=ids) | Q(
-            scanner_snapshot__scanner_config__experiment_id__in=ids
-        )
+        q |= Q(**{f"{targeting}__in": ids}) | Q(**{f"{config}__in": ids})
     return q
 
 
