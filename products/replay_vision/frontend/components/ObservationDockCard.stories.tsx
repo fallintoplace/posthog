@@ -37,7 +37,6 @@ const observation = (overrides: Partial<ReplayObservationApi> = {}): ReplayObser
                     'The user entered a coupon code three times, got a validation error each time, then submitted the payment form twice before leaving the page.',
             },
             signals_count: 1,
-            verification: null,
         },
         prompt_question: 'Did the user struggle to complete checkout?',
         triggered_by: 'schedule',
