@@ -89,7 +89,12 @@ class TestLearnedRules(_VisionAPITestCase):
             status=ObservationStatus.SUCCEEDED,
             completed_at=timezone.now(),
             scanner_result={
-                "model_output": {"scanner_type": "monitor", "verdict": "yes", "reasoning": "card declined"},
+                "model_output": {
+                    "scanner_type": "monitor",
+                    "verdict": "yes",
+                    "reasoning": "The card was declined at (t 12).",
+                    "confidence": 0.4,
+                },
                 "signals_count": 0,
             },
         )
@@ -119,6 +124,12 @@ class TestLearnedRules(_VisionAPITestCase):
         )
 
         assert refresh_team_learned_rules(self.team) is True
+
+        # Unexplained ratings only teach when the model can see what the scanner said about the session.
+        content = mock_generate.call_args.kwargs["user_content"]
+        assert "[verdict=yes] The card was declined at (t 12)." in content
+        assert "confidence 0.40" in content
+        assert "Team note: A declined card is not a bug." in content
         assert self._rulesets() == [
             (None, 1, ["Treat a declined card as normal checkout behavior."]),
             (str(self.scanner.id), 1, ["Flag only failures the user sees."]),

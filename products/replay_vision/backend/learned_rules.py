@@ -54,7 +54,9 @@ MAX_NEW_RATINGS_PER_RUN = 150
 # Earlier ratings shown per affected scanner, so a pattern across text-less ratings has something to stand on.
 MAX_CONTEXT_RATINGS_PER_SCANNER = 20
 _SCANNER_PROMPT_CHARS = 1200
-_REASONING_CHARS = 500
+# Long enough for most answers whole: without the session, the scanner's own words are all a pattern can rest on.
+_REASONING_CHARS = 2000
+_NOTABILITY_CHARS = 300
 _FEEDBACK_CHARS = 600
 # A first run reads ratings this far back; older ones may describe a scanner that has changed since.
 FIRST_RUN_LOOKBACK = dt.timedelta(days=90)
@@ -393,9 +395,42 @@ def _describe(rating: _Rating, scanner_version: int) -> str:
     thumb = "thumbs up" if rating.label.is_correct else "thumbs down"
     note = " ".join((rating.label.feedback or "").split())[:_FEEDBACK_CHARS]
     lines = [f"{rating.key}: {thumb}{stale}", f"  Scanner answered: [{outcome}] {reasoning}"]
+    details = _output_details(output)
+    if details:
+        lines.append(f"  Details: {details}")
+    signals = _signal_headlines(rating.observation)
+    if signals:
+        lines.append(f"  Also reported as issues: {signals}")
     if note:
         lines.append(f"  Team note: {note}")
     return "\n".join(lines)
+
+
+def _output_details(output: dict) -> str:
+    """Confidence, notability and the moment the scanner picked, which a pattern across unexplained ratings
+    can turn on (for example, every rejected answer being low-confidence)."""
+    parts: list[str] = []
+    confidence = output.get("confidence")
+    if isinstance(confidence, int | float):
+        parts.append(f"confidence {confidence:.2f}")
+    notability = output.get("notability")
+    if isinstance(notability, int | float):
+        reason = " ".join(str(output.get("notability_reason") or "").split())[:_NOTABILITY_CHARS]
+        parts.append(f"notability {notability:.2f}" + (f" ({reason})" if reason else ""))
+    key_moment_ms = output.get("key_moment_ms")
+    if isinstance(key_moment_ms, int):
+        parts.append(f"key moment at {key_moment_ms // 1000}s")
+    return "; ".join(parts)
+
+
+def _signal_headlines(observation: ReplayObservation) -> str:
+    result = observation.scanner_result if isinstance(observation.scanner_result, dict) else {}
+    headlines = [
+        f"{s.get('problem_type')}: {s.get('headline')}"
+        for s in result.get("signal_summaries") or []
+        if isinstance(s, dict) and s.get("headline")
+    ]
+    return "; ".join(headlines[:5])
 
 
 def _format_rules(rules: list[LearnedRule]) -> str:
