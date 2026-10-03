@@ -17,6 +17,7 @@ from posthog.models.organization import OrganizationMembership
 from products.replay_vision.backend.billing import observation_credits_for_model
 from products.replay_vision.backend.distinct_ids import replay_vision_distinct_id
 from products.replay_vision.backend.enqueue_claims import release_enqueue_claim
+from products.replay_vision.backend.learned_rules import current_ruleset_ids
 from products.replay_vision.backend.models.replay_observation import (
     ObservationStatus,
     ObservationTrigger,
@@ -270,6 +271,8 @@ def _create_observation(inputs: CreateObservationInputs) -> CreateObservationOut
     else:
         snapshot_dict = _build_scanner_snapshot(scanner)
         priced_model = scanner.model
+    # Learned rules are not scanner config, so a backfill runs with the current ones rather than frozen ones.
+    snapshot_dict["learned_ruleset_ids"] = current_ruleset_ids(scanner.team_id, scanner.id)
 
     # Deliberately check-then-act: the snapshot doesn't count enqueue claims, so a concurrent burst can
     # overshoot by at most the in-flight caps allow, which is accepted.
