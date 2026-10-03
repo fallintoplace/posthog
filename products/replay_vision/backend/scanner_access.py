@@ -7,7 +7,7 @@ appears once instead of at every reading call site."""
 
 import uuid
 from collections.abc import Iterable
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, Literal
 
 from django.db.models import Q
 
@@ -90,18 +90,25 @@ def scanner_experiment_scope_q(*, unrestricted: bool = False, experiment_ids: It
     return q
 
 
+_OBSERVATION_PREFIXES = ("", "observation__")
+
+
 def snapshot_experiment_scope_q(
-    *, unrestricted: bool = False, experiment_ids: Iterable[int] = (), prefix: str = ""
+    *, unrestricted: bool = False, experiment_ids: Iterable[int] = (), prefix: Literal["", "observation__"] = ""
 ) -> Q:
     """`scanner_experiment_scope_q` for observation rows, over the frozen `scanner_snapshot`. `prefix` reaches the
     observation through a relation, such as `observation__` from a label."""
+    if prefix not in _OBSERVATION_PREFIXES:
+        raise ValueError(f"unsupported observation prefix {prefix!r}")
     targeting = f"{prefix}scanner_snapshot__experiment_targeting__experiment_id"
     config = f"{prefix}scanner_snapshot__scanner_config__experiment_id"
     q = Q()
     if unrestricted:
+        # nosemgrep: orm-field-injection (both paths are fixed strings; prefix is allowlisted above)
         q |= Q(**{f"{targeting}__isnull": True, f"{config}__isnull": True})
     ids = list(experiment_ids)
     if ids:
+        # nosemgrep: orm-field-injection (both paths are fixed strings; prefix is allowlisted above)
         q |= Q(**{f"{targeting}__in": ids}) | Q(**{f"{config}__in": ids})
     return q
 
