@@ -2,7 +2,7 @@ import { useValues } from 'kea'
 
 import { Text } from '@posthog/quill'
 
-import { TodayInlineMarkdown } from './TodayInlineMarkdown'
+import { TodayMarkedText } from './TodayMarkedText'
 import { todayReportLogic } from './todayReportLogic'
 import { TodayReportSectionTitle } from './TodayReportSectionTitle'
 
@@ -13,7 +13,7 @@ export function TodayReportProposal({ reportId }: { reportId: string }): JSX.Ele
             <TodayReportSectionTitle>Proposal</TodayReportSectionTitle>
             {proposal ? (
                 <Text size="sm" render={<p />} className="leading-relaxed text-pretty">
-                    <TodayInlineMarkdown markdown={proposal} />
+                    <TodayMarkedText markdown={proposal} marked={[]} reportId={reportId} />
                 </Text>
             ) : (
                 <Text size="sm" variant="muted" render={<p />}>

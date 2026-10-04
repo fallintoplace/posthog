@@ -9,11 +9,14 @@ from .enums import (
     BriefingStatus,
     BriefingWriter,
     CitedSource,
+    FigureSourceKind,
+    FigureText,
     ImpactNumberKey,
     ItemGroup,
     ItemReason,
     ItemSource,
     ItemState,
+    KeyClauseRole,
 )
 
 
@@ -121,6 +124,46 @@ class CandidateList:
 
 
 @dataclass(frozen=True)
+class KeyClauseRequest:
+    text: str
+    roles: list[KeyClauseRole]
+
+
+@dataclass(frozen=True)
+class KeyClause:
+    start: int
+    end: int
+    text: str
+    role: KeyClauseRole
+    expansion: list[str]
+
+
+@dataclass(frozen=True)
+class TextKeyClauses:
+    text: str
+    key_clauses: list[KeyClause]
+
+
+@dataclass(frozen=True)
+class FigureQuote:
+    kind: FigureSourceKind
+    signal_id: str | None
+    at: datetime
+    sentence: str
+    start: int
+    end: int
+
+
+@dataclass(frozen=True)
+class FigureMark:
+    text: FigureText
+    start: int
+    end: int
+    figure: str
+    quote: FigureQuote
+
+
+@dataclass(frozen=True)
 class PullRequestLink:
     url: str
     number: int
@@ -209,3 +252,7 @@ class ReportPage:
     source_count: int
     impact_numbers: list[ImpactNumber]
     last_seen: datetime | None
+
+
+class JevTimedOut(Exception):
+    pass

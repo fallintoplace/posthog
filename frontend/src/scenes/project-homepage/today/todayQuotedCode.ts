@@ -106,6 +106,7 @@ export interface TodayCodeQuote {
     file: CodeFileApi
     read: RepositoryFileApi
     excerpt: TodayCodeWindow
+    candidates: TodayCodeWindow[]
 }
 
 function distinctMarked(excerpt: TodayCodeWindow): number {
@@ -124,7 +125,7 @@ export function findCodeQuote(
         const excerpt = candidates[0]
         const marksMore = !best || (excerpt && distinctMarked(excerpt) > distinctMarked(best.excerpt))
         if (read && excerpt && marksMore) {
-            best = { file, read, excerpt }
+            best = { file, read, excerpt, candidates }
         }
     }
     return best

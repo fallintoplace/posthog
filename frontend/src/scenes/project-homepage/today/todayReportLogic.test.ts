@@ -1,12 +1,15 @@
 import { expectLogic } from 'kea-test-utils'
 
+import { FEATURE_FLAGS } from 'lib/constants'
+import { featureFlagLogic } from 'lib/logic/featureFlagLogic'
+
 import { useMocks } from '~/mocks/jest'
 import { initKeaTests } from '~/test/init'
 
 import { makeReport } from 'products/signals/frontend/inbox/__mocks__/inboxMocks'
 import { inboxTaskKickoffLogic } from 'products/signals/frontend/inbox/inboxTaskKickoffLogic'
 import { SignalReport, SignalReportStatus } from 'products/signals/frontend/inbox/types'
-import type { ReportPageApi } from 'products/today/frontend/generated/api.schemas'
+import type { KeyClausesRequestApi, ReportPageApi } from 'products/today/frontend/generated/api.schemas'
 
 import { todayReportLogic } from './todayReportLogic'
 
@@ -55,5 +58,41 @@ describe('todayReportLogic', () => {
         await expectLogic(kickoffLogic, () => logic.actions.startWithPostHog())
             .toDispatchActions(kickoffs)
             .toNotHaveDispatchedActions([other])
+    })
+
+    test('asks Jev once per mark while a request is in flight', async () => {
+        const report = makeReport({ actionability: 'immediately_actionable', status: SignalReportStatus.READY })
+        const calls = { keyClauses: 0, figureMarks: 0 }
+        useMocks({
+            get: {
+                '/api/projects/:team_id/signals/reports/:id/': () => [200, report],
+                '/api/projects/:team_id/today/reports/:id/page/': () => [200, PAGE],
+                '/api/projects/:team_id/today/reports/:id/figure_marks/': () => {
+                    calls.figureMarks += 1
+                    return [200, { marks: [] }]
+                },
+            },
+            post: {
+                '/api/projects/:team_id/today/reports/:id/key_clauses/': async ({ request }) => {
+                    calls.keyClauses += 1
+                    const { requests } = (await request.json()) as KeyClausesRequestApi
+                    return [200, { texts: requests.map(({ text }) => ({ text, key_clauses: [] })) }]
+                },
+            },
+        })
+        initKeaTests()
+        featureFlagLogic.mount()
+        const logic = todayReportLogic({ reportId: report.id })
+        logic.mount()
+        await expectLogic(logic).toDispatchActions(['loadFullReportSuccess', 'loadPageSuccess'])
+
+        featureFlagLogic.actions.setFeatureFlags([FEATURE_FLAGS.TODAY_REPORT_JEV], {
+            [FEATURE_FLAGS.TODAY_REPORT_JEV]: true,
+        })
+        logic.actions.loadKeyClauses()
+        logic.actions.loadFigureMarks()
+        await expectLogic(logic).toFinishAllListeners()
+
+        expect(calls).toEqual({ keyClauses: 1, figureMarks: 1 })
     })
 })
